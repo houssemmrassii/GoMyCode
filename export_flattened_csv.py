@@ -109,7 +109,6 @@ def create_tables(engine):
     except Exception as e:
         raise RuntimeError(f"Table creation failed: {e}")
 
-# Process the CSV and load data
 def process_csv():
     engine = get_engine()
     reset_schema(engine)
@@ -134,41 +133,26 @@ def process_csv():
     
     # Clean data: handle missing values with mean/median/mode
     try:
-        # Numerical: Use median for professionalExperience
         df['professionalExperience'] = df['professionalExperience'].fillna(df['professionalExperience'].median())
-        
-        # Categorical: Use mode for StudentGender and Industry
         df['StudentGender'] = df['StudentGender'].fillna(df['StudentGender'].mode()[0])
         df['Industry'] = df['Industry'].fillna(df['Industry'].mode()[0])
-        
-        # Dates: Convert to datetime and fill with median date
         date_columns = ['StudentBirthDate', 'SubscriptionStartDate', 'SubscriptionEndDate', 'DiplomaDate']
         for col in date_columns:
             df[col] = pd.to_datetime(df[col], errors='coerce')
             median_date = df[col].median()
             df[col] = df[col].fillna(median_date)
-        
-        # Transform SubscriptionProgress to 0-1 range
         df['SubscriptionProgress'] = df['SubscriptionProgress'].fillna('0%').str.rstrip('%').astype(float) / 100.0
-        
-        # Debug: Check raw values
         print("Raw SubscriptionHasDiploma values:", df['SubscriptionHasDiploma'].head())
-        
-        # Transform SubscriptionHasDiploma to 0 or 1 (handling True/False), ensure integer type and handle nulls
         df['SubscriptionHasDiploma'] = df['SubscriptionHasDiploma'].fillna(False).astype(int)
-        
-        # Debug: Check transformed values
         print("Transformed SubscriptionHasDiploma values:", df['SubscriptionHasDiploma'].head())
     except Exception as e:
         raise ValueError(f"Data cleaning failed: {e}")
 
     # Transform
     try:
-        # Dim Instructor
         dim_instructor = df[['InstructorFullName', 'InstructorEmail', 'instructor_diploma']].drop_duplicates().reset_index(drop=True)
         dim_instructor['InstructorID'] = dim_instructor.index + 1
         
-        # Dim Course Offering
         course_offering_key = ['GroupName', 'SessionName', 'TrackName', 'Hackerspace', 'Country', 'ProductSchedule']
         dim_course_offering = df[course_offering_key + ['InstructorFullName', 'InstructorEmail']].drop_duplicates().reset_index(drop=True)
         dim_course_offering = dim_course_offering.merge(dim_instructor[['InstructorFullName', 'InstructorEmail', 'InstructorID']], 
@@ -176,11 +160,9 @@ def process_csv():
         dim_course_offering = dim_course_offering[course_offering_key + ['InstructorID']].reset_index(drop=True)
         dim_course_offering['CourseOfferingID'] = dim_course_offering.index + 1
         
-        # Dim Student
         dim_student = df[['Student', 'StudentGender', 'StudentBirthDate', 'professionalExperience', 'Industry']].drop_duplicates().reset_index(drop=True)
         dim_student['StudentID'] = dim_student.index + 1
         
-        # Dim Time
         dates = pd.concat([df['SubscriptionStartDate'], df['SubscriptionEndDate'], df['DiplomaDate']]).dropna().unique()
         dim_time = pd.DataFrame({'Date': pd.to_datetime(dates, errors='coerce')})
         dim_time['TimeID'] = dim_time.index + 1
@@ -188,7 +170,6 @@ def process_csv():
         dim_time['Month'] = dim_time['Date'].dt.month
         dim_time['Day'] = dim_time['Date'].dt.day
         
-        # Fact Subscription
         fact_subscription = df[['GroupName', 'Student', 'SubscriptionStartDate', 'SubscriptionEndDate', 'DiplomaDate', 
                               'SubscriptionProgress', 'SubscriptionHasDiploma']]
         fact_subscription = fact_subscription.merge(dim_course_offering[['GroupName', 'CourseOfferingID']], on='GroupName', how='left')
@@ -206,7 +187,6 @@ def process_csv():
     except Exception as e:
         raise RuntimeError(f"Data transformation failed: {e}")
 
-
     # Load data using pandas.to_sql with SQLAlchemy engine
     try:
         dim_student.to_sql('dim_student', engine, schema=SCHEMA, if_exists='append', index=False)
@@ -217,7 +197,81 @@ def process_csv():
         print(f"Processed {CSV_FILE} and loaded into PostgreSQL.")
     except Exception as e:
         raise RuntimeError(f"Data loading failed: {e}")
+
+    # Now export the flattened CSV for direct Looker Studio use
+    export_flattened_csv(dim_student, dim_instructor, dim_course_offering, dim_time, fact_subscription)
+
+def export_flattened_csv(dim_student, dim_instructor, dim_course_offering, dim_time, fact_subscription):
+    # Join fact_subscription with dims to get descriptive fields
     
+    # Join fact with dim_course_offering
+    fact_dim_course = fact_subscription.merge(
+        dim_course_offering, on='CourseOfferingID', how='left'
+    )
+    
+    # Join with dim_student
+    fact_dim_course_student = fact_dim_course.merge(
+        dim_student, on='StudentID', how='left'
+    )
+    
+    # Join with dim_time for start, end, diploma dates
+    # Rename dim_time columns for each time id
+    dim_time_start = dim_time.rename(columns={
+        'TimeID': 'StartTimeID',
+        'Date': 'SubscriptionStartDate',
+        'Year': 'StartYear',
+        'Month': 'StartMonth',
+        'Day': 'StartDay'
+    })
+    
+    dim_time_end = dim_time.rename(columns={
+        'TimeID': 'EndTimeID',
+        'Date': 'SubscriptionEndDate',
+        'Year': 'EndYear',
+        'Month': 'EndMonth',
+        'Day': 'EndDay'
+    })
+    
+    dim_time_diploma = dim_time.rename(columns={
+        'TimeID': 'DiplomaTimeID',
+        'Date': 'DiplomaDate',
+        'Year': 'DiplomaYear',
+        'Month': 'DiplomaMonth',
+        'Day': 'DiplomaDay'
+    })
+    
+    df = fact_dim_course_student.merge(
+        dim_time_start[['StartTimeID', 'SubscriptionStartDate', 'StartYear', 'StartMonth', 'StartDay']],
+        on='StartTimeID', how='left'
+    ).merge(
+        dim_time_end[['EndTimeID', 'SubscriptionEndDate', 'EndYear', 'EndMonth', 'EndDay']],
+        on='EndTimeID', how='left'
+    ).merge(
+        dim_time_diploma[['DiplomaTimeID', 'DiplomaDate', 'DiplomaYear', 'DiplomaMonth', 'DiplomaDay']],
+        on='DiplomaTimeID', how='left'
+    )
+    
+    # Drop IDs if not needed, keep descriptive columns
+    drop_cols = ['SubscriptionID', 'CourseOfferingID', 'StudentID', 'StartTimeID', 'EndTimeID', 'DiplomaTimeID']
+    df = df.drop(columns=drop_cols, errors='ignore')
+    
+    # Reorder columns if you want (example)
+    cols_order = [
+        'Student', 'StudentGender', 'StudentBirthDate', 'professionalExperience', 'Industry',
+        'GroupName', 'SessionName', 'TrackName', 'Hackerspace', 'Country', 'ProductSchedule',
+        'InstructorID', 'InstructorFullName', 'InstructorEmail', 'instructor_diploma',
+        'SubscriptionStartDate', 'StartYear', 'StartMonth', 'StartDay',
+        'SubscriptionEndDate', 'EndYear', 'EndMonth', 'EndDay',
+        'DiplomaDate', 'DiplomaYear', 'DiplomaMonth', 'DiplomaDay',
+        'SubscriptionProgress', 'SubscriptionHasDiploma'
+    ]
+    cols_order = [c for c in cols_order if c in df.columns]
+    df = df[cols_order]
+    
+    # Export flattened CSV
+    output_path = os.path.join(script_dir, 'flattened_subscription_data.csv')
+    df.to_csv(output_path, index=False)
+    print(f"Flattened CSV exported to {output_path}")
 
 if __name__ == "__main__":
     try:
